@@ -297,53 +297,41 @@ const DateApp: React.FC = () => {
 
     const formatTime = () => `${virtualTime.hours.toString().padStart(2, '0')}:${virtualTime.minutes.toString().padStart(2, '0')}`;
 
-    // 单次回复篇幅控制：目标至少 3000 个非空白字符；每次 API 请求最多 16000 tokens。
-    // 模型不支持 min_tokens，因此首轮不足时通过追加 assistant/user 消息自动续写。
+    // 单次回复篇幅要求：提示模型尽量一次生成至少 3000 个非空白字符；每次 API 请求最多 16000 tokens。
+    // 不做自动续写，不因回复长度不足而发起第二次 API 请求。
     const MIN_REPLY_CHARACTERS = 3000;
     const MAX_OUTPUT_TOKENS = 16000;
-    const MAX_CONTINUATION_ATTEMPTS = 4;
-
-    const countReplyCharacters = (value: string): number => Array.from(value.replace(/\s/g, '')).length;
 
     // peek / send / reroll 共用的 LLM 调用（提示词构建统一在 utils/datePrompts.ts）
     const callLLM = async (messages: ApiMessage[], temperature: number, speaker = char, purpose = '见面对话'): Promise<string> => {
         const dialogueApi = resolveDialogueApi(apiConfig, speaker);
-        const requestOnce = async (requestMessages: ApiMessage[], requestPurpose: string): Promise<string> => {
-            const response = await fetch(`${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey}` },
-                body: JSON.stringify({
-                    model: dialogueApi.model,
-                    messages: requestMessages,
-                    temperature,
-                    // Claude 原生 API 及部分 OpenAI→Claude 中转要求提供 max_tokens。
-                    max_tokens: MAX_OUTPUT_TOKENS,
-                    stream: dialogueApi.stream ?? false,
-                }),
-                __sullyMeta: { appId: 'date', appName: '见面', charId: speaker?.id, charName: speaker?.name, purpose: requestPurpose },
-            } as RequestInit);
-            if (!response.ok) throw new Error(`API Error ${response.status}`);
-            const data = await safeResponseJson(response);
-            // 思考型渠道可能把正文放在 reasoning_content；extractContent 统一处理渠道格式。
-            const content = extractContent(data);
-            if (!content) throw new Error('模型返回了空回复，请重试或检查渠道/模型设置');
-            return content;
+        const lengthInstruction: ApiMessage = {
+            role: 'system',
+            content: `本次回复请尽量一次性完成，正文至少达到 ${MIN_REPLY_CHARACTERS} 个非空白字符。请保持内容自然、连贯、符合角色与当前情境，不要用重复、灌水或无意义内容凑字数。不要要求或等待后续续写；本次 API 调用结束即结束。`,
         };
+        // 将篇幅要求放在已有 system 指令之后，且只发起一次请求。
+        const requestMessages = [...messages];
+        const lastSystemIndex = requestMessages.reduce((last, message, index) => message.role === 'system' ? index : last, -1);
+        requestMessages.splice(lastSystemIndex + 1, 0, lengthInstruction);
 
-        let content = await requestOnce(messages, purpose);
-        // 不把“最低字数”误当成模型硬保证：若不足，最多追加 4 次续写请求。
-        for (let attempt = 0; countReplyCharacters(content) < MIN_REPLY_CHARACTERS && attempt < MAX_CONTINUATION_ATTEMPTS; attempt++) {
-            const continuationMessages: ApiMessage[] = [
-                ...messages,
-                { role: 'assistant', content },
-                {
-                    role: 'user',
-                    content: `请从刚才停止的位置无缝继续当前回复，不要重复已经写过的内容，不要重新开头，也不要总结或收尾。保持原有角色、叙事视角、语气和格式，继续自然推进情节。当前累计正文约 ${countReplyCharacters(content)} 个非空白字符，请继续补充有实质内容的正文，直到整条回复达到至少 ${MIN_REPLY_CHARACTERS} 个非空白字符。只输出续写正文。`,
-                },
-            ];
-            const continuation = await requestOnce(continuationMessages, `${purpose}（自动续写 ${attempt + 1}/${MAX_CONTINUATION_ATTEMPTS}）`);
-            content += continuation;
-        }
+        const response = await fetch(`${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey}` },
+            body: JSON.stringify({
+                model: dialogueApi.model,
+                messages: requestMessages,
+                temperature,
+                // Claude 原生 API 及部分 OpenAI→Claude 中转要求提供 max_tokens。
+                max_tokens: MAX_OUTPUT_TOKENS,
+                stream: dialogueApi.stream ?? false,
+            }),
+            __sullyMeta: { appId: 'date', appName: '见面', charId: speaker?.id, charName: speaker?.name, purpose },
+        } as RequestInit);
+        if (!response.ok) throw new Error(`API Error ${response.status}`);
+        const data = await safeResponseJson(response);
+        // 思考型渠道可能把正文放在 reasoning_content；extractContent 统一处理渠道格式。
+        const content = extractContent(data);
+        if (!content) throw new Error('模型返回了空回复，请重试或检查渠道/模型设置');
         return content;
     };
 
