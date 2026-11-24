@@ -297,30 +297,53 @@ const DateApp: React.FC = () => {
 
     const formatTime = () => `${virtualTime.hours.toString().padStart(2, '0')}:${virtualTime.minutes.toString().padStart(2, '0')}`;
 
+    // 单次回复篇幅控制：目标至少 3000 个非空白字符；每次 API 请求最多 16000 tokens。
+    // 模型不支持 min_tokens，因此首轮不足时通过追加 assistant/user 消息自动续写。
+    const MIN_REPLY_CHARACTERS = 3000;
+    const MAX_OUTPUT_TOKENS = 16000;
+    const MAX_CONTINUATION_ATTEMPTS = 4;
+
+    const countReplyCharacters = (value: string): number => Array.from(value.replace(/\s/g, '')).length;
+
     // peek / send / reroll 共用的 LLM 调用（提示词构建统一在 utils/datePrompts.ts）
     const callLLM = async (messages: ApiMessage[], temperature: number, speaker = char, purpose = '见面对话'): Promise<string> => {
         const dialogueApi = resolveDialogueApi(apiConfig, speaker);
-        const response = await fetch(`${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey}` },
-            body: JSON.stringify({
-                model: dialogueApi.model,
-                messages,
-                temperature,
-                // max_tokens 是 Claude 原生 API 的必填字段；缺了它，糯米机/Csy 等
-                // OpenAI→Claude 中转会被上游打回，再包成 502 / bad_response_status_code。
-                // 与私聊 (useChatAI.ts) 对齐，统一带 8000。
-                max_tokens: 8000,
-                stream: dialogueApi.stream ?? false,
-            }),
-            __sullyMeta: { appId: 'date', appName: '见面', charId: speaker?.id, charName: speaker?.name, purpose },
-        } as RequestInit);
-        if (!response.ok) throw new Error(`API Error ${response.status}`);
-        const data = await safeResponseJson(response);
-        // 思考型渠道会把正文塞进 reasoning_content、content 留空——直接取 content
-        // 会拿到空串且不报错：感知页黑屏卡死（无按钮可退），会话里则落库空消息。
-        const content = extractContent(data);
-        if (!content) throw new Error('模型返回了空回复，请重试或检查渠道/模型设置');
+        const requestOnce = async (requestMessages: ApiMessage[], requestPurpose: string): Promise<string> => {
+            const response = await fetch(`${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey}` },
+                body: JSON.stringify({
+                    model: dialogueApi.model,
+                    messages: requestMessages,
+                    temperature,
+                    // Claude 原生 API 及部分 OpenAI→Claude 中转要求提供 max_tokens。
+                    max_tokens: MAX_OUTPUT_TOKENS,
+                    stream: dialogueApi.stream ?? false,
+                }),
+                __sullyMeta: { appId: 'date', appName: '见面', charId: speaker?.id, charName: speaker?.name, purpose: requestPurpose },
+            } as RequestInit);
+            if (!response.ok) throw new Error(`API Error ${response.status}`);
+            const data = await safeResponseJson(response);
+            // 思考型渠道可能把正文放在 reasoning_content；extractContent 统一处理渠道格式。
+            const content = extractContent(data);
+            if (!content) throw new Error('模型返回了空回复，请重试或检查渠道/模型设置');
+            return content;
+        };
+
+        let content = await requestOnce(messages, purpose);
+        // 不把“最低字数”误当成模型硬保证：若不足，最多追加 4 次续写请求。
+        for (let attempt = 0; countReplyCharacters(content) < MIN_REPLY_CHARACTERS && attempt < MAX_CONTINUATION_ATTEMPTS; attempt++) {
+            const continuationMessages: ApiMessage[] = [
+                ...messages,
+                { role: 'assistant', content },
+                {
+                    role: 'user',
+                    content: `请从刚才停止的位置无缝继续当前回复，不要重复已经写过的内容，不要重新开头，也不要总结或收尾。保持原有角色、叙事视角、语气和格式，继续自然推进情节。当前累计正文约 ${countReplyCharacters(content)} 个非空白字符，请继续补充有实质内容的正文，直到整条回复达到至少 ${MIN_REPLY_CHARACTERS} 个非空白字符。只输出续写正文。`,
+                },
+            ];
+            const continuation = await requestOnce(continuationMessages, `${purpose}（自动续写 ${attempt + 1}/${MAX_CONTINUATION_ATTEMPTS}）`);
+            content += continuation;
+        }
         return content;
     };
 
