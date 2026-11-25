@@ -297,39 +297,30 @@ const DateApp: React.FC = () => {
 
     const formatTime = () => `${virtualTime.hours.toString().padStart(2, '0')}:${virtualTime.minutes.toString().padStart(2, '0')}`;
 
-    // 单次回复篇幅要求：提示模型尽量一次生成至少 3000 个非空白字符；每次 API 请求最多 16000 tokens。
-    // 不做自动续写，不因回复长度不足而发起第二次 API 请求。
-    const MIN_REPLY_CHARACTERS = 3000;
-    const MAX_OUTPUT_TOKENS = 16000;
-
     // peek / send / reroll 共用的 LLM 调用（提示词构建统一在 utils/datePrompts.ts）
     const callLLM = async (messages: ApiMessage[], temperature: number, speaker = char, purpose = '见面对话'): Promise<string> => {
         const dialogueApi = resolveDialogueApi(apiConfig, speaker);
-        const lengthInstruction: ApiMessage = {
-            role: 'system',
-            content: `本次回复请尽量一次性完成，正文至少达到 ${MIN_REPLY_CHARACTERS} 个非空白字符。请保持内容自然、连贯、符合角色与当前情境，不要用重复、灌水或无意义内容凑字数。不要要求或等待后续续写；本次 API 调用结束即结束。`,
-        };
-        // 将篇幅要求放在已有 system 指令之后，且只发起一次请求。
-        const requestMessages = [...messages];
-        const lastSystemIndex = requestMessages.reduce((last, message, index) => message.role === 'system' ? index : last, -1);
-        requestMessages.splice(lastSystemIndex + 1, 0, lengthInstruction);
-
         const response = await fetch(`${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey}` },
             body: JSON.stringify({
                 model: dialogueApi.model,
-                messages: requestMessages,
+                messages,
                 temperature,
-                // Claude 原生 API 及部分 OpenAI→Claude 中转要求提供 max_tokens。
-                max_tokens: MAX_OUTPUT_TOKENS,
+                // max_tokens 是 Claude 原生 API 的必填字段；缺了它，糯米机/Csy 等
+                // OpenAI→Claude 中转会被上游打回，再包成 502 / bad_response_status_code。
+                // 单次请求：设置输出上限 16000，并尝试要求至少生成 2400 tokens。
+                // 注意：min_tokens 并非所有 OpenAI 兼容中转/模型都支持，可能被忽略或导致参数错误。
+                max_tokens: 16000,
+                min_tokens: 2400,
                 stream: dialogueApi.stream ?? false,
             }),
             __sullyMeta: { appId: 'date', appName: '见面', charId: speaker?.id, charName: speaker?.name, purpose },
         } as RequestInit);
         if (!response.ok) throw new Error(`API Error ${response.status}`);
         const data = await safeResponseJson(response);
-        // 思考型渠道可能把正文放在 reasoning_content；extractContent 统一处理渠道格式。
+        // 思考型渠道会把正文塞进 reasoning_content、content 留空——直接取 content
+        // 会拿到空串且不报错：感知页黑屏卡死（无按钮可退），会话里则落库空消息。
         const content = extractContent(data);
         if (!content) throw new Error('模型返回了空回复，请重试或检查渠道/模型设置');
         return content;
